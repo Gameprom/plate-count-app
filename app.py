@@ -2,16 +2,19 @@ import streamlit as st
 import cv2
 import numpy as np
 import pandas as pd
+import base64
+from datetime import datetime
 
 st.set_page_config(page_title="Standard Plate Count App", page_icon="🧫", layout="wide")
 st.title("🧫 โปรแกรม Standard Plate Count (ช่วงมาตรฐาน 30 - 300 Colonies)")
-st.write("ระบุชื่อเชื้อ อัปโหลดภาพจานเพาะเชื้อแยกตามระดับ Dilution (10⁻¹ ถึง 10⁻¹⁰) เพื่อนับจำนวนและคำนวณค่าเฉลี่ย CFU/mL")
+st.write("ระบุชื่อเชื้อ อัปโหลดภาพจานเพาะเชื้อแยกตามระดับ Dilution (10⁻¹ ถึง 10⁻¹⁰) เพื่อนับจำนวน คำนวณค่าเฉลี่ย และออกรายงาน")
 
 # =================================================================
 # แถบเมนูด้านข้าง (Sidebar)
 # =================================================================
 st.sidebar.header("🧪 1. ข้อมูลตัวอย่างและการทดลอง")
 organism_name = st.sidebar.text_input("ชื่อเชื้อ / ชื่อตัวอย่าง (Sample Name)", value="E. coli (ตัวอย่างที่ 1)")
+tester_name = st.sidebar.text_input("ผู้ทำการทดสอบ (Analyst)", value="เจ้าหน้าที่ห้องปฏิบัติการ")
 volume_ml = st.sidebar.number_input("ปริมาตรที่ลงเชื้อ (mL)", min_value=0.01, max_value=10.0, value=0.1, step=0.05)
 
 st.sidebar.markdown("---")
@@ -28,7 +31,6 @@ st.subheader("📤 อัปโหลดภาพถ่ายจานเพา�
 st.caption("อัปโหลดเฉพาะระดับ Dilution ที่ต้องการนับ (อย่างละ 1 รูป) ช่องไหนไม่ได้ทำทดลองสามารถปล่อยว่างไว้ได้ครับ")
 
 uploaded_dict = {}
-# แบ่งช่องอัปโหลดเป็น 2 แถว แถวละ 5 คอลัมน์ (10^-1 ถึง 10^-10)
 cols_row1 = st.columns(5)
 for i in range(1, 6):
     with cols_row1[i - 1]:
@@ -44,15 +46,88 @@ for i in range(6, 11):
             uploaded_dict[i] = file
 
 # =================================================================
+# ฟังก์ชันสร้างไฟล์รายงาน HTML (รวมตาราง + รูปภาพ + ค่าเฉลี่ย)
+# =================================================================
+def generate_html_report(org_name, analyst, vol, avg_text, df_table, img_list):
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    table_html = df_table.to_html(index=False, border=1, classes="report-table")
+    
+    images_html = ""
+    for dil_exp, filename, count, status, cfu, _, img_bytes in img_list:
+        b64_img = base64.b64encode(img_bytes).decode('utf-8')
+        images_html += f"""
+        <div class="img-card">
+            <h4>Dilution 10<sup>-{dil_exp}</sup> ({filename})</h4>
+            <p><strong>นับได้:</strong> {count} Colonies | <strong>CFU/mL:</strong> {cfu:.2e}</p>
+            <p><strong>สถานะ:</strong> {status}</p>
+            <img src="data:image/jpeg;base64,{b64_img}" alt="Dilution 10-{dil_exp}">
+        </div>
+        """
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="th">
+    <head>
+        <meta charset="UTF-8">
+        <title>รายงานผลการวิเคราะห์ Plate Count - {org_name}</title>
+        <style>
+            body {{ font-family: 'Sarabun', 'Tahoma', sans-serif; margin: 30px; color: #222; }}
+            .header {{ border-bottom: 2px solid #2c3e50; padding-bottom: 15px; margin-bottom: 20px; }}
+            .header h1 {{ margin: 0; color: #1a5276; font-size: 24px; }}
+            .meta-info {{ display: flex; justify-content: space-between; margin-top: 10px; font-size: 14px; color: #555; }}
+            .summary-box {{ background-color: #eafaf1; border-left: 5px solid #2ecc71; padding: 15px; margin-bottom: 25px; font-size: 16px; }}
+            .report-table {{ width: 100%; border-collapse: collapse; margin-bottom: 30px; font-size: 14px; }}
+            .report-table th {{ background-color: #2c3e50; color: white; padding: 10px; text-align: center; }}
+            .report-table td {{ padding: 8px; text-align: center; border: 1px solid #ddd; }}
+            .report-table tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .img-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }}
+            .img-card {{ border: 1px solid #ccc; border-radius: 8px; padding: 12px; text-align: center; page-break-inside: avoid; }}
+            .img-card h4 {{ margin: 5px 0; color: #1a5276; }}
+            .img-card p {{ margin: 4px 0; font-size: 13px; }}
+            .img-card img {{ max-width: 100%; height: auto; border-radius: 4px; margin-top: 8px; }}
+            @media print {{
+                body {{ margin: 10mm; }}
+                .no-print {{ display: none; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="background:#fff3cd; padding:10px; margin-bottom:20px; border-radius:5px; text-align:center;">
+            💡 <strong>คำแนะนำ:</strong> กดปุ่ม <strong>Ctrl + P</strong> (หรือ Command + P) เพื่อบันทึกเอกสารนี้เป็นไฟล์ <strong>PDF</strong> ได้ทันที
+        </div>
+        <div class="header">
+            <h1>รายงานผลการวิเคราะห์ปริมาณจุลินทรีย์ (Standard Plate Count Report)</h1>
+            <div class="meta-info">
+                <div><strong>ชื่อเชื้อ / ตัวอย่าง:</strong> {org_name} &nbsp;|&nbsp; <strong>ปริมาตรที่ลงเชื้อ:</strong> {vol} mL</div>
+                <div><strong>ผู้ทดสอบ:</strong> {analyst} &nbsp;|&nbsp; <strong>วันที่ออกรายงาน:</strong> {now_str}</div>
+            </div>
+        </div>
+        
+        <div class="summary-box">
+            {avg_text}
+        </div>
+
+        <h3>1. ตารางสรุปผลการนับ Colony รายระดับการเจือจาง</h3>
+        {table_html}
+
+        <h3>2. ภาพถ่ายจานเพาะเชื้อและตำแหน่งการตรวจจับ</h3>
+        <div class="img-grid">
+            {images_html}
+        </div>
+    </body>
+    </html>
+    """
+    return html_content.encode('utf-8')
+
+# =================================================================
 # ส่วนประมวลผลภาพและคำนวณผลลัพธ์
 # =================================================================
 if uploaded_dict:
     st.markdown("---")
     summary_data = []
     processed_images = []
-    valid_cfu_list = [] # เก็บค่า CFU/mL ของจานที่อยู่ในช่วง 30-300
+    valid_cfu_list = []
 
-    # วนลูปประมวลผลตามลำดับ Dilution จากน้อยไปมาก
     for dil_exp in sorted(uploaded_dict.keys()):
         uploaded_file = uploaded_dict[dil_exp]
         dilution_factor = 10 ** (-dil_exp)
@@ -112,10 +187,8 @@ if uploaded_dict:
                     cv2.putText(output, str(colony_count), (int(x) - 10, int(y) - radius - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # คำนวณ CFU/mL ของจานนี้
             cfu_per_ml = colony_count / (dilution_factor * volume_ml)
 
-            # ตรวจสอบเกณฑ์มาตรฐาน 30 - 300 Colonies
             if 30 <= colony_count <= 300:
                 status = "✅ อยู่ในเกณฑ์ (30-300)"
                 valid_cfu_list.append(cfu_per_ml)
@@ -147,31 +220,44 @@ if uploaded_dict:
             })
 
     # =================================================================
-    # แสดงผลสรุปค่าเฉลี่ย CFU/mL (เฉพาะช่วง 30 - 300 Colonies)
+    # แสดงผลสรุปค่าเฉลี่ย CFU/mL และปุ่มดาวน์โหลดรายงาน
     # =================================================================
     st.subheader(f"📋 สรุปผลการวิเคราะห์เชื้อ: {organism_name}")
     
     if valid_cfu_list:
         avg_cfu = sum(valid_cfu_list) / len(valid_cfu_list)
+        report_avg_html = f"<strong>ค่าเฉลี่ยปริมาณเชื้อ (ช่วง 30 - 300 Colonies):</strong> {avg_cfu:,.0f} CFU/mL ({avg_cfu:.2e} CFU/mL) — <em>คำนวณจาก {len(valid_cfu_list)} Dilution ที่ผ่านเกณฑ์</em>"
         st.success(
             f"### 🎯 ค่าเฉลี่ยปริมาณเชื้อ (ช่วง 30 - 300 Colonies): **{avg_cfu:,.0f} CFU/mL** ({avg_cfu:.2e} CFU/mL)\n"
             f"*(คำนวณเฉลี่ยจากจานที่ผ่านเกณฑ์จำนวน {len(valid_cfu_list)} Dilution)*"
         )
     else:
+        report_avg_html = "<strong>หมายเหตุ:</strong> ยังไม่มีจานเพาะเชื้อที่อยู่ในเกณฑ์มาตรฐาน 30 - 300 Colonies"
         st.warning("⚠️ **ยังไม่มีจานเพาะเชื้อที่อยู่ในเกณฑ์มาตรฐาน 30 - 300 Colonies** (ระบบจึงยังไม่สามารถคำนวณค่าเฉลี่ยมาตรฐานได้ กรุณาตรวจสอบตารางด้านล่าง)")
 
-    # แสดงตารางผลลัพธ์ทั้งหมด
     df = pd.DataFrame(summary_data)
     st.dataframe(df, use_container_width=True)
 
-    # ปุ่มดาวน์โหลด CSV
-    csv_data = df.to_csv(index=False).encode('utf-8-sig')
-    st.download_button(
-        label=f"📥 ดาวน์โหลดผลลัพธ์ของ {organism_name} (ไฟล์ CSV / Excel)",
-        data=csv_data,
-        file_name=f"plate_count_{organism_name.replace(' ', '_')}.csv",
-        mime="text/csv"
-    )
+    # จัดวางปุ่มดาวน์โหลด 2 ปุ่มคู่กัน (รายงานฉบับเต็ม + ไฟล์ Excel/CSV)
+    dl_col1, dl_col2 = st.columns(2)
+    with dl_col1:
+        report_bytes = generate_html_report(organism_name, tester_name, volume_ml, report_avg_html, df, processed_images)
+        st.download_button(
+            label="📄 ดาวน์โหลดรายงานฉบับเต็ม (ตาราง + รูปภาพ / พิมพ์เป็น PDF ได้)",
+            data=report_bytes,
+            file_name=f"Report_{organism_name.replace(' ', '_')}.html",
+            mime="text/html",
+            use_container_width=True
+        )
+    with dl_col2:
+        csv_data = df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📊 ดาวน์โหลดเฉพาะตารางข้อมูล (ไฟล์ CSV / Excel)",
+            data=csv_data,
+            file_name=f"Data_{organism_name.replace(' ', '_')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 
     # =================================================================
     # แสดงภาพผลการนับราย Dilution
@@ -179,7 +265,7 @@ if uploaded_dict:
     st.markdown("---")
     st.subheader("🖼️ ภาพผลการนับเชื้อแต่ละ Dilution")
     
-    img_cols = st.columns(3) # แสดงแถวละ 3 ภาพเพื่อให้ดูเทียบกันได้ง่าย
+    img_cols = st.columns(3)
     for idx, (dil_exp, filename, count, status, cfu, img_rgb, img_bytes) in enumerate(processed_images):
         with img_cols[idx % 3]:
             st.markdown(f"**Dilution 10⁻{dil_exp}** | นับได้ **{count}** Colonies")
