@@ -24,6 +24,14 @@ margin = st.sidebar.slider("ระยะบีบขอบกันเส้น�
 min_area = st.sidebar.slider("ขนาดพื้นที่เชื้อเล็กสุด (พิกเซล)", 1, 100, 5)
 max_area = st.sidebar.slider("ขนาดพื้นที่เชื้อใหญ่สุด (พิกเซล)", 500, 5000, 1000)
 
+st.sidebar.markdown("---")
+st.sidebar.header("🔬 3. แยกจุดติดกัน (Watershed)")
+watershed_dist = st.sidebar.slider(
+    "ความไวในการแยกจุดติดกัน (0 = ปิด)", 
+    min_value=0.0, max_value=0.8, value=0.45, step=0.05,
+    help="ยิ่งค่าสูง ยิ่งแยกจุดที่ติดกันได้ละเอียดขึ้น (แนะนำ 0.40 - 0.55 หากจุดเล็กๆ ถูกแบ่งเกินให้ลดค่าลง)"
+)
+
 # =================================================================
 # ส่วนอัปโหลดรูปภาพแยกตามระดับ Dilution 10^-1 ถึง 10^-10
 # =================================================================
@@ -46,7 +54,7 @@ for i in range(6, 11):
             uploaded_dict[i] = file
 
 # =================================================================
-# ฟังก์ชันสร้างไฟล์รายงาน HTML (รวมตาราง + รูปภาพ + ค่าเฉลี่ย)
+# ฟังก์ชันสร้างไฟล์รายงาน HTML
 # =================================================================
 def generate_html_report(org_name, analyst, vol, avg_text, df_table, img_list):
     now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -102,25 +110,18 @@ def generate_html_report(org_name, analyst, vol, avg_text, df_table, img_list):
                 <div><strong>ผู้ทดสอบ:</strong> {analyst} &nbsp;|&nbsp; <strong>วันที่ออกรายงาน:</strong> {now_str}</div>
             </div>
         </div>
-        
-        <div class="summary-box">
-            {avg_text}
-        </div>
-
+        <div class="summary-box">{avg_text}</div>
         <h3>1. ตารางสรุปผลการนับ Colony รายระดับการเจือจาง</h3>
         {table_html}
-
         <h3>2. ภาพถ่ายจานเพาะเชื้อและตำแหน่งการตรวจจับ</h3>
-        <div class="img-grid">
-            {images_html}
-        </div>
+        <div class="img-grid">{images_html}</div>
     </body>
     </html>
     """
     return html_content.encode('utf-8')
 
 # =================================================================
-# ส่วนประมวลผลภาพและคำนวณผลลัพธ์
+# ส่วนประมวลผลภาพและคำนวณผลลัพธ์ (อัปเกรด Watershed)
 # =================================================================
 if uploaded_dict:
     st.markdown("---")
@@ -170,7 +171,41 @@ if uploaded_dict:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             closed = cv2.morphologyEx(clean_thresh, cv2.MORPH_CLOSE, kernel)
 
-            contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # -------------------------------------------------------------
+            # ขั้นตอนใหม่: Watershed Algorithm สำหรับแยกจุด Colony ที่ติดกัน
+            # -------------------------------------------------------------
+            if watershed_dist > 0:
+                # 1. หาพื้นที่พื้นหลังที่แน่นอน (Sure Background)
+                sure_bg = cv2.dilate(closed, kernel, iterations=2)
+                
+                # 2. หาจุดศูนย์กลางของเชื้อแต่ละก้อน (Distance Transform)
+                dist_transform = cv2.distanceTransform(closed, cv2.DIST_L2, 5)
+                if dist_transform.max() > 0:
+                    _, sure_fg = cv2.threshold(dist_transform, watershed_dist * dist_transform.max(), 255, 0)
+                    sure_fg = np.uint8(sure_fg)
+                    
+                    # 3. หาบริเวณรอยต่อที่ไม่แน่ใจ (Unknown region)
+                    unknown = cv2.subtract(sure_bg, sure_fg)
+                    
+                    # 4. ติดป้ายกำกับยอดเขาแต่ละจุด (Markers)
+                    _, markers = cv2.connectedComponents(sure_fg)
+                    markers = markers + 1
+                    markers[unknown == 255] = 0
+                    
+                    # 5. รัน Watershed เพื่อสร้างเส้นแบ่งเขตระหว่างจุดที่ติดกัน
+                    img_for_ws = cv2.cvtColor(closed, cv2.COLOR_GRAY2BGR)
+                    markers = cv2.watershed(img_for_ws, markers)
+                    
+                    # สร้างภาพขาวดำใหม่ที่ถูกผ่าแบ่งเส้นรอยต่อแล้ว (เส้นแบ่งมีค่า -1)
+                    separated = closed.copy()
+                    separated[markers == -1] = 0
+                else:
+                    separated = closed
+            else:
+                separated = closed
+
+            # ค้นหา Contours จากภาพที่ผ่านการแยกจุดติดกันแล้ว
+            contours, _ = cv2.findContours(separated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             colony_count = 0
             cv2.circle(output, (center_x, center_y), inner_radius - margin, (255, 200, 0), 2)
@@ -238,7 +273,6 @@ if uploaded_dict:
     df = pd.DataFrame(summary_data)
     st.dataframe(df, use_container_width=True)
 
-    # จัดวางปุ่มดาวน์โหลด 2 ปุ่มคู่กัน (รายงานฉบับเต็ม + ไฟล์ Excel/CSV)
     dl_col1, dl_col2 = st.columns(2)
     with dl_col1:
         report_bytes = generate_html_report(organism_name, tester_name, volume_ml, report_avg_html, df, processed_images)
@@ -259,9 +293,6 @@ if uploaded_dict:
             use_container_width=True
         )
 
-    # =================================================================
-    # แสดงภาพผลการนับราย Dilution
-    # =================================================================
     st.markdown("---")
     st.subheader("🖼️ ภาพผลการนับเชื้อแต่ละ Dilution")
     
