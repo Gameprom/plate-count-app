@@ -1,23 +1,23 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import cv2
 import numpy as np
 import pandas as pd
 import base64
+import json
 from datetime import datetime
-from PIL import Image
-from streamlit_image_coordinates import streamlit_image_coordinates
 
 st.set_page_config(page_title="Standard Plate Count App", page_icon="🧫", layout="wide")
 st.title("🧫 โปรแกรม Standard Plate Count (ช่วงมาตรฐาน 30 - 300 Colonies)")
-st.write("ระบุชื่อเชื้อ อัปโหลดภาพจานเพาะเชื้อแยกตามระดับ Dilution (10⁻¹ ถึง 10⁻¹⁰) พร้อมระบบซูมขยายและคลิกแก้ไขจุดนับ")
+st.write("ระบุชื่อเชื้อ อัปโหลดภาพจานเพาะเชื้อแยกตามระดับ Dilution (10⁻¹ ถึง 10⁻¹⁰) พร้อมระบบซูมและลากภาพด้วยเมาส์")
 
 # สร้างตัวแปรหน่วยความจำ (Session State)
 if "manual_adds" not in st.session_state:
     st.session_state.manual_adds = {}
 if "manual_removes" not in st.session_state:
     st.session_state.manual_removes = {}
-if "last_click" not in st.session_state:
-    st.session_state.last_click = {}
+if "processed_event_ids" not in st.session_state:
+    st.session_state.processed_event_ids = set()
 
 # =================================================================
 # แถบเมนูด้านข้าง (Sidebar)
@@ -43,7 +43,7 @@ watershed_dist = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎨 4. การแสดงผลบนภาพ")
-show_numbers = st.sidebar.checkbox("แสดงตัวเลขกำกับบนจุดเชื้อ", value=True, help="เอาติ๊กถูกออกหากตัวเลขบังจุดเชื้อที่อยู่ชิดกัน")
+show_numbers = st.sidebar.checkbox("แสดงตัวเลขกำกับบนจุดเชื้อ", value=True)
 
 # =================================================================
 # ส่วนอัปโหลดรูปภาพแยกตามระดับ Dilution 10^-1 ถึง 10^-10
@@ -65,6 +65,177 @@ for i in range(6, 11):
         file = st.file_uploader(f"Dilution 10⁻{i}", type=["jpg", "jpeg", "png"], key=f"dil_{i}")
         if file is not None:
             uploaded_dict[i] = file
+
+# =================================================================
+# ฟังก์ชันสร้างกล่องแสดงภาพที่ซูมด้วยลูกกลิ้งเมาส์ + ลากเลื่อนได้ (Interactive Canvas)
+# =================================================================
+def interactive_zoom_canvas(img_rgb, click_mode_str, key_id):
+    # แปลงภาพเป็น Base64 เพื่อส่งให้ HTML5 Canvas
+    _, buffer = cv2.imencode('.jpg', cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    b64_str = base64.b64encode(buffer).decode('utf-8')
+    orig_h, orig_w = img_rgb.shape[:2]
+
+    # สร้าง HTML + JavaScript สำหรับซูมด้วยลูกกลิ้งเมาส์ ลากเลื่อน และส่งพิกัดคลิกกลับมายัง Python
+    html_code = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <style>
+        body {{ margin: 0; padding: 0; overflow: hidden; background-color: #111; font-family: sans-serif; }}
+        #container {{ position: relative; width: 100%; height: 650px; border: 2px solid #444; border-radius: 8px; overflow: hidden; cursor: crosshair; }}
+        canvas {{ display: block; }}
+        #toolbar {{
+            position: absolute; top: 10px; left: 10px; z-index: 10;
+            background: rgba(0, 0, 0, 0.75); color: white; padding: 8px 12px;
+            border-radius: 6px; font-size: 13px; pointer-events: none;
+        }}
+        #resetBtn {{
+            position: absolute; top: 10px; right: 10px; z-index: 10;
+            background: #2c3e50; color: white; border: 1px solid #666;
+            padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+        }}
+        #resetBtn:hover {{ background: #34495e; }}
+    </style>
+    </head>
+    <body>
+    <div id="container">
+        <div id="toolbar">
+            🖱️ <b>หมุนลูกกลิ้งเมาส์:</b> ซูมเข้า-ออก &nbsp;|&nbsp; ✋ <b>คลิกขวาค้างแล้วลาก (หรือกด Spacebar+ลาก):</b> เลื่อนรูป &nbsp;|&nbsp; 🎯 <b>คลิกซ้าย:</b> {click_mode_str}
+        </div>
+        <button id="resetBtn" onclick="resetView()">🔍 รีเซ็ตมุมมอง (100%)</button>
+        <canvas id="canvas"></canvas>
+    </div>
+
+    <script>
+        // เชื่อมต่อกับระบบส่งข้อมูลกลับของ Streamlit
+        function sendMessageToStreamlitClient(type, data) {{
+            var outData = Object.assign({{ isStreamlitMessage: true, type: type }}, data);
+            window.parent.postMessage(outData, "*");
+        }}
+        function init() {{
+            sendMessageToStreamlitClient("streamlit:componentReady", {{apiVersion: 1}});
+            sendMessageToStreamlitClient("streamlit:setFrameHeight", {{height: 660}});
+        }}
+        function setComponentValue(value) {{
+            sendMessageToStreamlitClient("streamlit:setComponentValue", {{value: value}});
+        }}
+
+        const container = document.getElementById('container');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        const img = new Image();
+        img.src = "data:image/jpeg;base64,{b64_str}";
+
+        let scale = 1.0;
+        let offsetX = 0;
+        let offsetY = 0;
+        let isDragging = false;
+        let startDragX = 0;
+        let startDragY = 0;
+        let spacePressed = false;
+
+        function resizeCanvas() {{
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
+            draw();
+        }}
+
+        function resetView() {{
+            const scaleX = canvas.width / {orig_w};
+            const scaleY = canvas.height / {orig_h};
+            scale = Math.min(scaleX, scaleY) * 0.95;
+            offsetX = (canvas.width - {orig_w} * scale) / 2;
+            offsetY = (canvas.height - {orig_h} * scale) / 2;
+            draw();
+        }}
+
+        img.onload = function() {{
+            resizeCanvas();
+            resetView();
+        }};
+        window.addEventListener('resize', resizeCanvas);
+
+        function draw() {{
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(offsetX, offsetY);
+            ctx.scale(scale, scale);
+            ctx.drawImage(img, 0, 0);
+            ctx.restore();
+        }}
+
+        // ซูมด้วยลูกกลิ้งเมาส์ตรงตำแหน่งเคอร์เซอร์
+        canvas.addEventListener('wheel', function(e) {{
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+
+            const zoomIntensity = 0.15;
+            const wheel = e.deltaY < 0 ? 1 : -1;
+            const zoom = Math.exp(wheel * zoomIntensity);
+
+            const newScale = Math.min(Math.max(0.2, scale * zoom), 15.0);
+            offsetX = mouseX - (mouseX - offsetX) * (newScale / scale);
+            offsetY = mouseY - (mouseY - offsetY) * (newScale / scale);
+            scale = newScale;
+            draw();
+        }}, {{ passive: false }});
+
+        // ปิดเมนูคลิกขวาปกติของเบราว์เซอร์เพื่อให้ใช้คลิกขวาลากภาพได้
+        canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+        window.addEventListener('keydown', e => {{ if(e.code === 'Space') {{ spacePressed = true; container.style.cursor = 'grab'; }} }});
+        window.addEventListener('keyup', e => {{ if(e.code === 'Space') {{ spacePressed = false; container.style.cursor = 'crosshair'; }} }});
+
+        canvas.addEventListener('mousedown', function(e) {{
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+
+            // คลิกขวา (button === 2) หรือ คลิกกลาง (button === 1) หรือ กด Spacebar ค้าง = ลากเลื่อนภาพ
+            if (e.button === 2 || e.button === 1 || spacePressed) {{
+                isDragging = true;
+                startDragX = mouseX - offsetX;
+                startDragY = mouseY - offsetY;
+                container.style.cursor = 'grabbing';
+            }} 
+            // คลิกซ้าย (button === 0) = เพิ่มหรือลบจุด Colony
+            else if (e.button === 0) {{
+                const realX = Math.round((mouseX - offsetX) / scale);
+                const realY = Math.round((mouseY - offsetY) / scale);
+                if (realX >= 0 && realX <= {orig_w} && realY >= 0 && realY <= {orig_h}) {{
+                    setComponentValue({{
+                        x: realX,
+                        y: realY,
+                        event_id: Date.now() + "_" + Math.random()
+                    }});
+                }}
+            }}
+        }});
+
+        window.addEventListener('mousemove', function(e) {{
+            if (!isDragging) return;
+            const rect = canvas.getBoundingClientRect();
+            offsetX = (e.clientX - rect.left) - startDragX;
+            offsetY = (e.clientY - rect.top) - startDragY;
+            draw();
+        }});
+
+        window.addEventListener('mouseup', function() {{
+            if (isDragging) {{
+                isDragging = false;
+                container.style.cursor = spacePressed ? 'grab' : 'crosshair';
+            }}
+        }});
+
+        init();
+    </script>
+    </body>
+    </html>
+    """
+    return components.html(html_code, height=665)
 
 # =================================================================
 # ฟังก์ชันสร้างไฟล์รายงาน HTML
@@ -227,7 +398,6 @@ if uploaded_dict:
             for (px, py, pr, ptype) in all_points:
                 colony_count += 1
                 color = (0, 255, 0) if ptype == "auto" else (255, 180, 0)
-                # ปรับเส้นวงกลมให้บางลง (1.5 -> 1 หรือ 2) เพื่อให้เห็นจุดเชื้อด้านในชัดเจน
                 cv2.circle(output, (px, py), pr, color, 2)
                 if show_numbers:
                     cv2.putText(output, str(colony_count), (px - 8, py - pr - 3),
@@ -305,96 +475,24 @@ if uploaded_dict:
         )
 
     # =================================================================
-    # ส่วนตรวจสอบภาพแบบซูมขยายได้ + คลิกแก้ไขจุดนับด้วยมือ
+    # ส่วนตรวจสอบภาพแบบใช้เมาส์ซูมและลากเลื่อนได้อิสระ
     # =================================================================
     if processed_images:
         st.markdown("---")
-        st.subheader("🔍 ตรวจสอบแบบซูมขยาย และคลิกแก้ไขจุดนับด้วยมือ")
+        st.subheader("🔍 ตรวจสอบแบบใช้เมาส์ซูม/ลากเลื่อน และคลิกแก้ไขจุดนับ")
         
-        # 1. เลือก Dilution ที่ต้องการขยายดูแบบเต็มจอ
         dil_options = {f"Dilution 10⁻{item[0]} ({item[1]}) — นับได้ {item[2]} Colonies": idx for idx, item in enumerate(processed_images)}
-        selected_label = st.selectbox("เลือกจานเพาะเชื้อที่ต้องการตรวจสอบและแก้ไข:", list(dil_options.keys()))
+        selected_label = st.selectbox("เลือกจานเพาะเชื้อที่ต้องการตรวจสอบ:", list(dil_options.keys()))
         selected_idx = dil_options[selected_label]
         
         dil_exp, filename, count, status, cfu, img_rgb, img_bytes = processed_images[selected_idx]
 
-        # 2. แถบเครื่องมือคลิก และ ตัวควบคุมการซูมขยาย (Zoom & Pan)
-        ctrl_col1, ctrl_col2 = st.columns([1.2, 1])
-        with ctrl_col1:
-            click_mode = st.radio(
-                "เลือกเครื่องมือคลิกบนภาพ:",
-                ["➕ คลิกเพื่อเพิ่มจุด Colony (วงสีฟ้า)", "➖ คลิกเพื่อลบจุดที่นับเกิน / ฝุ่น"],
-                horizontal=True
-            )
-        with ctrl_col2:
-            zoom_level = st.radio(
-                "ระดับการซูมขยายภาพ (Zoom):",
-                ["1x (ภาพเต็มจาน)", "2x (ขยาย 2 เท่า)", "3x (ขยาย 3 เท่า - ดูจุดจิ๋ว)"],
-                horizontal=True
-            )
+        click_mode = st.radio(
+            "โหมดเมื่อคลิกซ้ายบนภาพ:",
+            ["➕ เพิ่มจุด Colony (วงสีฟ้า)", "➖ ลบจุดที่นับเกิน / ฝุ่น"],
+            horizontal=True
+        )
 
-        pil_img = Image.fromarray(img_rgb)
-        orig_w, orig_h = pil_img.size
-
-        # คำนวณพื้นที่ตัดภาพ (Crop) ตามระดับการซูมและตำแหน่งเลื่อน
-        if "1x" in zoom_level:
-            zoom_factor = 1.0
-            crop_x, crop_y = 0, 0
-            crop_w, crop_h = orig_w, orig_h
-        else:
-            zoom_factor = 2.0 if "2x" in zoom_level else 3.0
-            crop_w = int(orig_w / zoom_factor)
-            crop_h = int(orig_h / zoom_factor)
-            
-            pan_c1, pan_c2 = st.columns(2)
-            with pan_c1:
-                pan_x_pct = st.slider("↔️ เลื่อนดูซ้าย - ขวา (%)", 0, 100, 50, key=f"pan_x_{dil_exp}")
-            with pan_c2:
-                pan_y_pct = st.slider("↕️ เลื่อนดูบน - ล่าง (%)", 0, 100, 50, key=f"pan_y_{dil_exp}")
-                
-            crop_x = int((orig_w - crop_w) * (pan_x_pct / 100.0))
-            crop_y = int((orig_h - crop_h) * (pan_y_pct / 100.0))
-
-        # ตัดเฉพาะส่วนที่ซูมมาแสดงผลขนาดใหญ่เต็มจอ (850px)
-        cropped_pil = pil_img.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
-        display_w = 850
-        scale = crop_w / display_w
-
-        st.markdown(f"**กำลังแสดงผล:** Dilution 10⁻{dil_exp} | นับได้ **{count}** Colonies ({status}) | **ซูม {zoom_level}**")
+        st.markdown(f"**กำลังแสดงผล:** Dilution 10⁻{dil_exp} | นับได้ **{count}** Colonies ({status})")
         
-        coords = streamlit_image_coordinates(cropped_pil, width=display_w, key=f"zoom_click_{dil_exp}_{zoom_level}")
-
-        if coords is not None:
-            click_tuple = (coords["x"], coords["y"], crop_x, crop_y)
-            if st.session_state.last_click.get(dil_exp) != click_tuple:
-                st.session_state.last_click[dil_exp] = click_tuple
-                # แปลงพิกัดจากภาพที่ซูม กลับไปเป็นพิกัดจริงบนภาพต้นฉบับได้อย่างแม่นยำ
-                real_x = int(crop_x + (coords["x"] * scale))
-                real_y = int(crop_y + (coords["y"] * scale))
-
-                if "เพิ่มจุด" in click_mode:
-                    st.session_state.manual_adds[dil_exp].append((real_x, real_y))
-                else:
-                    matched_add = [p for p in st.session_state.manual_adds[dil_exp] if np.hypot(real_x - p[0], real_y - p[1]) < 25]
-                    if matched_add:
-                        st.session_state.manual_adds[dil_exp].remove(matched_add[0])
-                    else:
-                        st.session_state.manual_removes[dil_exp].append((real_x, real_y))
-                st.rerun()
-
-        # ปุ่มจัดการด้านล่างภาพ
-        b_col1, b_col2 = st.columns(2)
-        with b_col1:
-            if st.button(f"🔄 รีเซ็ตการแก้ไขทั้งหมดของ Dilution 10⁻{dil_exp}", use_container_width=True):
-                st.session_state.manual_adds[dil_exp] = []
-                st.session_state.manual_removes[dil_exp] = []
-                st.session_state.last_click[dil_exp] = None
-                st.rerun()
-        with b_col2:
-            st.download_button(
-                label=f"💾 ดาวน์โหลดภาพผลลัพธ์เต็มใบ (Dilution 10⁻{dil_exp})",
-                data=img_bytes,
-                file_name=f"counted_10-{dil_exp}_{filename}",
-                mime="image/jpeg",
-                use_container_width=True
-            )
+        # เรียกใช้หน้าต่างภาพที่ซูมด้วยลูกกลิ้งเมาส์และคลิกขวาค
