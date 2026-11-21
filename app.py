@@ -238,7 +238,6 @@ if uploaded_dict:
                 output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
                 _, img_encoded = cv2.imencode('.jpg', output)
                 
-                # เก็บภาพขาวดำ (separated) ไว้สำหรับแสดงเปรียบเทียบคู่กัน
                 processed_images.append((plate_id, dil_exp, rep_idx, uploaded_file.name, colony_count, plate_cfu, output_rgb, separated, img_encoded.tobytes()))
 
         # สรุปผลราย Dilution
@@ -315,21 +314,13 @@ if uploaded_dict:
         )
 
     # =================================================================
-    # ส่วนตรวจสอบภาพแบบซูมขยายได้ (แสดงภาพสีคู่กับภาพขาวดำ)
+    # ส่วนแสดงรูปภาพทั้งหมดเรียงต่อกันยาวลงมา (พร้อมซูมและคลิกแก้ไขได้ทุกจาน)
     # =================================================================
     if processed_images:
         st.markdown("---")
-        st.subheader("🔍 ตรวจสอบภาพแบบขยายใหญ่ (เปรียบเทียบภาพสี & ภาพขาวดำ) และคลิกแก้ไขจุดนับ")
+        st.subheader("🖼️ ภาพผลการนับเชื้อทั้งหมด (เรียงตามลำดับ Dilution — คลิกแก้ไขจุดนับได้ทุกภาพ)")
         
-        plate_options = {
-            f"Dilution 10⁻{item[1]} — จานที่ {item[2]+1} ({item[3]}) | นับได้ {item[4]} Colonies": idx 
-            for idx, item in enumerate(processed_images)
-        }
-        selected_label = st.selectbox("เลือกจานเพาะเชื้อที่ต้องการตรวจสอบ:", list(plate_options.keys()))
-        selected_idx = plate_options[selected_label]
-        
-        plate_id, dil_exp, rep_idx, filename, count, plate_cfu, img_rgb, img_bw, img_bytes = processed_images[selected_idx]
-
+        # แถบเครื่องมือควบคุมการคลิกและการซูมใช้ร่วมกันสำหรับทุกภาพ
         c_col1, c_col2 = st.columns([1.2, 1])
         with c_col1:
             click_mode = st.radio(
@@ -339,59 +330,65 @@ if uploaded_dict:
             )
         with c_col2:
             zoom_size = st.select_slider(
-                "🔍 ปรับขนาดความกว้างภาพ (พิกเซล):",
+                "🔍 ปรับขนาดความกว้างภาพทั้งหมด (พิกเซล):",
                 options=[550, 750, 1000, 1400, 1800],
                 value=750
             )
 
-        st.markdown(f"**กำลังแสดงผล:** Dilution 10⁻{dil_exp} (จานที่ {rep_idx+1}) | นับได้ **{count}** Colonies | ความกว้างภาพ **{zoom_size} px**")
-        
-        pil_img = Image.fromarray(img_rgb)
-        orig_w, orig_h = pil_img.size
-        scale = orig_w / zoom_size
+        # วนลูปแสดงรูปภาพทุกจานเรียงต่อกันยาวลงมา
+        for plate_id, dil_exp, rep_idx, filename, count, plate_cfu, img_rgb, img_bw, img_bytes in processed_images:
+            st.markdown("---")
+            st.markdown(f"### 🧫 Dilution 10⁻{dil_exp} — จานที่ {rep_idx+1} (`{filename}`) | นับได้ **{count}** Colonies ({plate_cfu:.2e} CFU/mL)")
+            
+            pil_img = Image.fromarray(img_rgb)
+            orig_w, orig_h = pil_img.size
+            scale = orig_w / zoom_size
 
-        # แบ่งหน้าจอแสดงภาพ 2 คอลัมน์ (ซ้าย: ภาพสีคลิกแก้ไขได้ / ขวา: ภาพขาวดำเปรียบเทียบ)
-        if show_bw_image:
-            view_col1, view_col2 = st.columns(2)
-            with view_col1:
+            # แสดงภาพสี (คลิกแก้ไขได้) คู่กับภาพขาวดำ
+            if show_bw_image:
+                view_col1, view_col2 = st.columns(2)
+                with view_col1:
+                    st.caption("🟢 **ภาพสีผลลัพธ์ (คลิกบนภาพนี้เพื่อเพิ่ม/ลบจุด)**")
+                    coords = streamlit_image_coordinates(pil_img, width=zoom_size, key=f"img_zoom_{plate_id}_{zoom_size}")
+                with view_col2:
+                    st.caption("⚫ **ภาพขาวดำ (สิ่งที่ระบบตรวจจับเป็นจุดเชื้อ)**")
+                    st.image(img_bw, width=zoom_size)
+            else:
                 st.caption("🟢 **ภาพสีผลลัพธ์ (คลิกบนภาพนี้เพื่อเพิ่ม/ลบจุด)**")
                 coords = streamlit_image_coordinates(pil_img, width=zoom_size, key=f"img_zoom_{plate_id}_{zoom_size}")
-            with view_col2:
-                st.caption("⚫ **ภาพขาวดำ (สิ่งที่ระบบตรวจจับเป็นจุดเชื้อ)**")
-                st.image(img_bw, width=zoom_size)
-        else:
-            st.caption("🟢 **ภาพสีผลลัพธ์ (คลิกบนภาพนี้เพื่อเพิ่ม/ลบจุด)**")
-            coords = streamlit_image_coordinates(pil_img, width=zoom_size, key=f"img_zoom_{plate_id}_{zoom_size}")
 
-        if coords is not None:
-            click_tuple = (coords["x"], coords["y"], zoom_size)
-            if st.session_state.last_click.get(plate_id) != click_tuple:
-                st.session_state.last_click[plate_id] = click_tuple
-                real_x = int(coords["x"] * scale)
-                real_y = int(coords["y"] * scale)
+            # ตรวจจับการคลิกบนภาพของจานนี้
+            if coords is not None:
+                click_tuple = (coords["x"], coords["y"], zoom_size)
+                if st.session_state.last_click.get(plate_id) != click_tuple:
+                    st.session_state.last_click[plate_id] = click_tuple
+                    real_x = int(coords["x"] * scale)
+                    real_y = int(coords["y"] * scale)
 
-                if "เพิ่มจุด" in click_mode:
-                    st.session_state.manual_adds[plate_id].append((real_x, real_y))
-                else:
-                    matched_add = [p for p in st.session_state.manual_adds[plate_id] if np.hypot(real_x - p[0], real_y - p[1]) < 25]
-                    if matched_add:
-                        st.session_state.manual_adds[plate_id].remove(matched_add[0])
+                    if "เพิ่มจุด" in click_mode:
+                        st.session_state.manual_adds[plate_id].append((real_x, real_y))
                     else:
-                        st.session_state.manual_removes[plate_id].append((real_x, real_y))
-                st.rerun()
+                        matched_add = [p for p in st.session_state.manual_adds[plate_id] if np.hypot(real_x - p[0], real_y - p[1]) < 25]
+                        if matched_add:
+                            st.session_state.manual_adds[plate_id].remove(matched_add[0])
+                        else:
+                            st.session_state.manual_removes[plate_id].append((real_x, real_y))
+                    st.rerun()
 
-        b_col1, b_col2 = st.columns(2)
-        with b_col1:
-            if st.button("🔄 รีเซ็ตการแก้ไขทั้งหมดของจานนี้", use_container_width=True):
-                st.session_state.manual_adds[plate_id] = []
-                st.session_state.manual_removes[plate_id] = []
-                st.session_state.last_click[plate_id] = None
-                st.rerun()
-        with b_col2:
-            st.download_button(
-                label=f"💾 ดาวน์โหลดภาพผลลัพธ์เต็มใบ (Dilution 10⁻{dil_exp} จานที่ {rep_idx+1})",
-                data=img_bytes,
-                file_name=f"counted_10-{dil_exp}_rep{rep_idx+1}_{filename}",
-                mime="image/jpeg",
-                use_container_width=True
-            )
+            # ปุ่มรีเซ็ตและดาวน์โหลดแยกประจำแต่ละจาน
+            b_col1, b_col2 = st.columns(2)
+            with b_col1:
+                if st.button(f"🔄 รีเซ็ตการแก้ไขของ Dilution 10⁻{dil_exp} (จานที่ {rep_idx+1})", key=f"reset_{plate_id}", use_container_width=True):
+                    st.session_state.manual_adds[plate_id] = []
+                    st.session_state.manual_removes[plate_id] = []
+                    st.session_state.last_click[plate_id] = None
+                    st.rerun()
+            with b_col2:
+                st.download_button(
+                    label=f"💾 ดาวน์โหลดภาพ Dilution 10⁻{dil_exp} (จานที่ {rep_idx+1})",
+                    data=img_bytes,
+                    file_name=f"counted_10-{dil_exp}_rep{rep_idx+1}_{filename}",
+                    mime="image/jpeg",
+                    key=f"dl_{plate_id}",
+                    use_container_width=True
+                )
