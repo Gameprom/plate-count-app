@@ -4,10 +4,20 @@ import numpy as np
 import pandas as pd
 import base64
 from datetime import datetime
+from PIL import Image
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 st.set_page_config(page_title="Standard Plate Count App", page_icon="🧫", layout="wide")
 st.title("🧫 โปรแกรม Standard Plate Count (ช่วงมาตรฐาน 30 - 300 Colonies)")
-st.write("ระบุชื่อเชื้อ อัปโหลดภาพจานเพาะเชื้อแยกตามระดับ Dilution (10⁻¹ ถึง 10⁻¹⁰) เพื่อนับจำนวน คำนวณค่าเฉลี่ย และออกรายงาน")
+st.write("ระบุชื่อเชื้อ อัปโหลดภาพจานเพาะเชื้อแยกตามระดับ Dilution (10⁻¹ ถึง 10⁻¹⁰) พร้อมระบบคลิกแก้ไขจุดนับด้วยมือ")
+
+# สร้างตัวแปรหน่วยความจำ (Session State) สำหรับเก็บจุดที่ผู้ใช้คลิกเพิ่มหรือลบ
+if "manual_adds" not in st.session_state:
+    st.session_state.manual_adds = {}  # {dil_exp: [(x, y), ...]}
+if "manual_removes" not in st.session_state:
+    st.session_state.manual_removes = {}  # {dil_exp: [(x, y), ...]}
+if "last_click" not in st.session_state:
+    st.session_state.last_click = {}
 
 # =================================================================
 # แถบเมนูด้านข้าง (Sidebar)
@@ -28,8 +38,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔬 3. แยกจุดติดกัน (Watershed)")
 watershed_dist = st.sidebar.slider(
     "ความไวในการแยกจุดติดกัน (0 = ปิด)", 
-    min_value=0.0, max_value=0.8, value=0.45, step=0.05,
-    help="ยิ่งค่าสูง ยิ่งแยกจุดที่ติดกันได้ละเอียดขึ้น (แนะนำ 0.40 - 0.55 หากจุดเล็กๆ ถูกแบ่งเกินให้ลดค่าลง)"
+    min_value=0.0, max_value=0.8, value=0.45, step=0.05
 )
 
 # =================================================================
@@ -113,7 +122,7 @@ def generate_html_report(org_name, analyst, vol, avg_text, df_table, img_list):
         <div class="summary-box">{avg_text}</div>
         <h3>1. ตารางสรุปผลการนับ Colony รายระดับการเจือจาง</h3>
         {table_html}
-        <h3>2. ภาพถ่ายจานเพาะเชื้อและตำแหน่งการตรวจจับ</h3>
+        <h3>2. ภาพถ่ายจานเพาะเชื้อและตำแหน่งการตรวจจับ (🟢 อัตโนมัติ / 🔵 เพิ่มด้วยมือ)</h3>
         <div class="img-grid">{images_html}</div>
     </body>
     </html>
@@ -121,7 +130,7 @@ def generate_html_report(org_name, analyst, vol, avg_text, df_table, img_list):
     return html_content.encode('utf-8')
 
 # =================================================================
-# ส่วนประมวลผลภาพและคำนวณผลลัพธ์ (อัปเกรด Watershed)
+# ส่วนประมวลผลภาพ + ระบบคลิกแก้ไขด้วยมือ (Manual Correction)
 # =================================================================
 if uploaded_dict:
     st.markdown("---")
@@ -132,6 +141,12 @@ if uploaded_dict:
     for dil_exp in sorted(uploaded_dict.keys()):
         uploaded_file = uploaded_dict[dil_exp]
         dilution_factor = 10 ** (-dil_exp)
+
+        # เตรียม list เก็บพิกัดที่ผู้ใช้แก้ไขสำหรับ Dilution นี้
+        if dil_exp not in st.session_state.manual_adds:
+            st.session_state.manual_adds[dil_exp] = []
+        if dil_exp not in st.session_state.manual_removes:
+            st.session_state.manual_removes[dil_exp] = []
 
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
         image = cv2.imdecode(file_bytes, 1)
@@ -171,32 +186,19 @@ if uploaded_dict:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             closed = cv2.morphologyEx(clean_thresh, cv2.MORPH_CLOSE, kernel)
 
-            # -------------------------------------------------------------
-            # ขั้นตอนใหม่: Watershed Algorithm สำหรับแยกจุด Colony ที่ติดกัน
-            # -------------------------------------------------------------
+            # Watershed Algorithm
             if watershed_dist > 0:
-                # 1. หาพื้นที่พื้นหลังที่แน่นอน (Sure Background)
                 sure_bg = cv2.dilate(closed, kernel, iterations=2)
-                
-                # 2. หาจุดศูนย์กลางของเชื้อแต่ละก้อน (Distance Transform)
                 dist_transform = cv2.distanceTransform(closed, cv2.DIST_L2, 5)
                 if dist_transform.max() > 0:
                     _, sure_fg = cv2.threshold(dist_transform, watershed_dist * dist_transform.max(), 255, 0)
                     sure_fg = np.uint8(sure_fg)
-                    
-                    # 3. หาบริเวณรอยต่อที่ไม่แน่ใจ (Unknown region)
                     unknown = cv2.subtract(sure_bg, sure_fg)
-                    
-                    # 4. ติดป้ายกำกับยอดเขาแต่ละจุด (Markers)
                     _, markers = cv2.connectedComponents(sure_fg)
                     markers = markers + 1
                     markers[unknown == 255] = 0
-                    
-                    # 5. รัน Watershed เพื่อสร้างเส้นแบ่งเขตระหว่างจุดที่ติดกัน
                     img_for_ws = cv2.cvtColor(closed, cv2.COLOR_GRAY2BGR)
                     markers = cv2.watershed(img_for_ws, markers)
-                    
-                    # สร้างภาพขาวดำใหม่ที่ถูกผ่าแบ่งเส้นรอยต่อแล้ว (เส้นแบ่งมีค่า -1)
                     separated = closed.copy()
                     separated[markers == -1] = 0
                 else:
@@ -204,23 +206,33 @@ if uploaded_dict:
             else:
                 separated = closed
 
-            # ค้นหา Contours จากภาพที่ผ่านการแยกจุดติดกันแล้ว
             contours, _ = cv2.findContours(separated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            colony_count = 0
-            cv2.circle(output, (center_x, center_y), inner_radius - margin, (255, 200, 0), 2)
-
+            # รวบรวมจุดที่ระบบตรวจจับได้อัตโนมัติ (กรองจุดที่ผู้ใช้สั่งลบออก)
+            auto_points = []
             for cnt in contours:
                 area = cv2.contourArea(cnt)
                 if min_area < area < max_area:
-                    colony_count += 1
                     (x, y), radius = cv2.minEnclosingCircle(cnt)
-                    center = (int(x), int(y))
-                    radius = int(radius) + 3
-                    
-                    cv2.circle(output, center, radius, (0, 255, 0), 2)
-                    cv2.putText(output, str(colony_count), (int(x) - 10, int(y) - radius - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    # เช็กว่าจุดนี้อยู่ใกล้พิกัดที่ผู้ใช้สั่งลบหรือไม่ (รัศมี 20 พิกเซล)
+                    is_removed = any(np.hypot(x - rx, y - ry) < 20 for (rx, ry) in st.session_state.manual_removes[dil_exp])
+                    if not is_removed:
+                        auto_points.append((int(x), int(y), int(radius) + 3, "auto"))
+
+            # รวมจุดอัตโนมัติ + จุดที่ผู้ใช้คลิกเพิ่มด้วยมือ
+            all_points = auto_points + [(ax, ay, 12, "manual") for (ax, ay) in st.session_state.manual_adds[dil_exp]]
+
+            # วาดขอบเขตพื้นที่นับสีฟ้าอ่อน
+            cv2.circle(output, (center_x, center_y), inner_radius - margin, (255, 200, 0), 2)
+
+            colony_count = 0
+            for (px, py, pr, ptype) in all_points:
+                colony_count += 1
+                # สีเขียว (0, 255, 0) สำหรับจุดอัตโนมัติ, สีฟ้าสด (255, 180, 0) สำหรับจุดที่คลิกเพิ่มด้วยมือ
+                color = (0, 255, 0) if ptype == "auto" else (255, 180, 0)
+                cv2.circle(output, (px, py), pr, color, 2)
+                cv2.putText(output, str(colony_count), (px - 10, py - pr - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             cfu_per_ml = colony_count / (dilution_factor * volume_ml)
 
@@ -293,19 +305,68 @@ if uploaded_dict:
             use_container_width=True
         )
 
+    # =================================================================
+    # ส่วนแสดงภาพและระบบคลิกแก้ไขจุดนับด้วยมือบนภาพ (Interactive Click)
+    # =================================================================
     st.markdown("---")
-    st.subheader("🖼️ ภาพผลการนับเชื้อแต่ละ Dilution")
-    
-    img_cols = st.columns(3)
+    st.subheader("🖱️ ตรวจสอบและคลิกแก้ไขจุดนับด้วยมือบนภาพ")
+    st.info("💡 **วิธีใช้งาน:** คลิกบนรูปภาพด้านล่างเพื่อ **เพิ่มจุดนับ (วงสีฟ้า)** หรือ **ลบจุดที่นับเกิน** ระบบจะคำนวณตัวเลขและค่าเฉลี่ยในตารางด้านบนใหม่ให้อัตโนมัติทันที")
+
+    # เลือกโหมดการคลิก (เพิ่มจุด หรือ ลบจุด)
+    click_mode = st.radio(
+        "เลือกเครื่องมือคลิกบนภาพ:",
+        ["➕ คลิกเพื่อเพิ่มจุด Colony (วงสีฟ้า)", "➖ คลิกเพื่อลบจุดที่นับเกิน / ฝุ่น"],
+        horizontal=True
+    )
+
+    img_cols = st.columns(2)  # แสดงแถวละ 2 ภาพขนาดใหญ่เพื่อให้คลิกได้แม่นยำ
     for idx, (dil_exp, filename, count, status, cfu, img_rgb, img_bytes) in enumerate(processed_images):
-        with img_cols[idx % 3]:
-            st.markdown(f"**Dilution 10⁻{dil_exp}** | นับได้ **{count}** Colonies")
-            st.caption(f"สถานะ: {status} | {cfu:.2e} CFU/mL")
-            st.image(img_rgb, use_container_width=True)
-            st.download_button(
-                label=f"💾 โหลดภาพ 10⁻{dil_exp}",
-                data=img_bytes,
-                file_name=f"counted_10-{dil_exp}_{filename}",
-                mime="image/jpeg",
-                key=f"dl_{dil_exp}"
-            )
+        with img_cols[idx % 2]:
+            st.markdown(f"#### Dilution 10⁻{dil_exp} | นับได้ **{count}** Colonies ({status})")
+            
+            # แปลงภาพเป็น PIL และปรับขนาดความกว้างแสดงผลเป็น 500px เพื่อให้คลิกง่ายและคำนวณพิกัดแม่นยำ
+            pil_img = Image.fromarray(img_rgb)
+            orig_w, orig_h = pil_img.size
+            display_w = 500
+            scale = orig_w / display_w
+
+            # แสดงภาพที่คลิกได้
+            coords = streamlit_image_coordinates(pil_img, width=display_w, key=f"click_img_{dil_exp}")
+
+            # ตรวจสอบเมื่อมีการคลิกใหม่เกิดขึ้น
+            if coords is not None:
+                click_tuple = (coords["x"], coords["y"])
+                if st.session_state.last_click.get(dil_exp) != click_tuple:
+                    st.session_state.last_click[dil_exp] = click_tuple
+                    # แปลงพิกัดบนหน้าจอ (500px) กลับเป็นพิกัดจริงของรูปต้นฉบับ
+                    real_x = int(coords["x"] * scale)
+                    real_y = int(coords["y"] * scale)
+
+                    if "เพิ่มจุด" in click_mode:
+                        st.session_state.manual_adds[dil_exp].append((real_x, real_y))
+                    else:
+                        # เช็กก่อนว่าจุดที่คลิกลบ เป็นจุดที่เคยคลิกเพิ่มเองหรือไม่
+                        matched_add = [p for p in st.session_state.manual_adds[dil_exp] if np.hypot(real_x - p[0], real_y - p[1]) < 25]
+                        if matched_add:
+                            st.session_state.manual_adds[dil_exp].remove(matched_add[0])
+                        else:
+                            st.session_state.manual_removes[dil_exp].append((real_x, real_y))
+                    st.rerun()
+
+            # ปุ่มรีเซ็ตการแก้ไขเฉพาะจานนี้ และปุ่มดาวน์โหลดภาพ
+            btn_c1, btn_c2 = st.columns(2)
+            with btn_c1:
+                if st.button(f"🔄 รีเซ็ตการแก้ไขภาพ 10⁻{dil_exp}", key=f"reset_{dil_exp}", use_container_width=True):
+                    st.session_state.manual_adds[dil_exp] = []
+                    st.session_state.manual_removes[dil_exp] = []
+                    st.session_state.last_click[dil_exp] = None
+                    st.rerun()
+            with btn_c2:
+                st.download_button(
+                    label=f"💾 โหลดภาพ 10⁻{dil_exp}",
+                    data=img_bytes,
+                    file_name=f"counted_10-{dil_exp}_{filename}",
+                    mime="image/jpeg",
+                    key=f"dl_{dil_exp}",
+                    use_container_width=True
+                )
